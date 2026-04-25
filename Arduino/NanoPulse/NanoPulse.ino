@@ -26,18 +26,10 @@ GyverBME280 bme;
 MPU6050 mpu;
 
 // === BURNOUT THRESHOLDS ===
-// MPU6050 at ±2 g: 16 384 LSB/g.
-// At rest the vertical (Y) axis reads ≈ 16 384 (gravity reaction).
-// During motor burn it reads well above that; in free-fall it drops to ≈ 0.
-//
-// Tune these to your motor's thrust-to-weight ratio:
-//   BOOST_THRESHOLD    : raw ADU above which we declare motor burning    (1.25 g)
-//   BURNOUT_THRESHOLD  : raw ADU below which we declare motor burnt out  (1.05 g)
-//   *_CONFIRM_CNT      : consecutive 20 Hz samples required (≈ 150 ms each)
-#define BOOST_THRESHOLD 20480    // 1.25 g
-#define BURNOUT_THRESHOLD 17200  // 1.05 g
-#define BOOST_CONFIRM_CNT 3
-#define BURNOUT_CONFIRM_CNT 3
+#define BOOST_THRESHOLD 4096    // 2.00 g
+#define BURNOUT_THRESHOLD 2150  // 1.05 g
+#define BOOST_CONFIRM_CNT 2
+#define BURNOUT_CONFIRM_CNT 2
 
 // === FLAGS ===
 uint8_t TeamID = 0xFF;
@@ -75,85 +67,102 @@ const unsigned long LOG_INT = 50;  // 20 Hz
 uint8_t checkCommandsMaxTime = 100;
 
 struct {
-  float alt;        // fused relative altitude  [m]
-  float vel;        // fused vertical velocity   [m/s]
-  float vel_imu;    // IMU-only integrated velocity (internal)
-  float last_baro;  // previous baro relative altitude
+  float alt;
+  float vel_v;
+  float vel_v_imu;
+  float vel_fwd;
+  float last_baro;
   unsigned long lastT;
   bool initialized;
 } fuse;
 
 void fusionReset(float baro_rel) {
   fuse.alt = baro_rel;
-  fuse.vel = 0.0f;
-  fuse.vel_imu = 0.0f;
+  fuse.vel_v = 0.0f;
+  fuse.vel_v_imu = 0.0f;
+  fuse.vel_fwd = 0.0f;
   fuse.last_baro = baro_rel;
   fuse.lastT = millis();
   fuse.initialized = true;
 }
 
-void fusionUpdate(float baro_rel, int16_t aly) {
+void fusionUpdate(float baro_rel, int16_t alx, int16_t aly, int16_t alz) {
   if (!fuse.initialized) {
     fusionReset(baro_rel);
     return;
   }
-
   unsigned long now = millis();
   float dt = (now - fuse.lastT) * 0.001f;
   fuse.lastT = now;
-  if (dt <= 0.0f || dt > 0.3f) dt = 0.02f;  // guard against timer glitches
-
-  // ── Barometric velocity (finite difference) ──────────────────────
+  if (dt <= 0.0f || dt > 0.3f) dt = 0.02f;
+  // ---------------------------------------------------
+  // BARO vertical velocity
+  // ---------------------------------------------------
   float vel_baro = (baro_rel - fuse.last_baro) / dt;
   fuse.last_baro = baro_rel;
-  vel_baro = constrain(vel_baro, -400.0f, 400.0f);
+  vel_baro = constrain(vel_baro, -400, 400);
+  // ---------------------------------------------------
+  // MPU scaling for ±16G
+  // ---------------------------------------------------
+  float ax = ((float)alx / 2048.0f) * g;
+  float ay = ((float)aly / 2048.0f) * g;
+  float az = ((float)alz / 2048.0f) * g;
+  // Vertical axis compensation
+  float acc_v = ay - g;
+  // Horizontal magnitude
+  float acc_fwd = sqrt(ax * ax + az * az);
 
-  // ── IMU net vertical acceleration ────────────────────────────────
-  // Y axis points up → at rest reads +1 g. Subtracting g gives net body acc.
-  float acc = ((float)aly / 16384.0f) * g - g;
-  if (fabsf(acc) < 0.20f) acc = 0.0f;  // noise dead-band
-
-  // Don't integrate IMU while on ground — prevents pre-flight drift
+  if (fabs(acc_v) < 0.25f) acc_v = 0;
+  if (acc_fwd < 0.25f) acc_fwd = 0;
+  // ---------------------------------------------------
+  // BEFORE launch / landed = zero MPU drift
+  // ---------------------------------------------------
   if (!launched || landed) {
-    fuse.vel_imu = 0.0f;
-    acc = 0.0f;
+    acc_v = 0;
+    acc_fwd = 0;
+    fuse.vel_v_imu = 0;
+    fuse.vel_fwd = 0;
   }
-
-  // Integrate IMU velocity
-  fuse.vel_imu += acc * dt;
-  fuse.vel_imu = constrain(fuse.vel_imu, -500.0f, 500.0f);
-
-  // ── Dynamic blending weights ─────────────────────────────────────
-  //  Ground / landed : pure baro   (IMU drift irrelevant)
-  //  Boost phase     : 90 % IMU    (baro lags badly at high speed)
-  //  Coast / descent : ramp by speed 15 → 75 % IMU
-  float speed = fabsf(fuse.vel);
+  // ---------------------------------------------------
+  // AFTER APOGEE = disable MPU contribution
+  // ---------------------------------------------------
+  if (hit_apogee) {
+    acc_v = 0;
+    acc_fwd = 0;
+  }
+  // ---------------------------------------------------
+  // Integrate velocities
+  // ---------------------------------------------------
+  fuse.vel_v_imu += acc_v * dt;
+  fuse.vel_fwd += acc_fwd * dt;
+  fuse.vel_v_imu = constrain(fuse.vel_v_imu, -500, 500);
+  fuse.vel_fwd = constrain(fuse.vel_fwd, 0, 500);
+  // ---------------------------------------------------
+  // Weighting
+  // ---------------------------------------------------
   float imu_w;
-
-  if (!launched || landed) {
-    imu_w = 0.0f;
+  if (!launched || landed || hit_apogee) {
+    imu_w = 0.0f;  // after apogee = baro only
   } else if (in_boost) {
     imu_w = 0.90f;
   } else {
-    imu_w = constrain(speed / 60.0f, 0.15f, 0.75f);
+    imu_w = 0.45f;
   }
+  // ---------------------------------------------------
+  // Vertical fused velocity
+  // ---------------------------------------------------
+  fuse.vel_v = imu_w * fuse.vel_v_imu + (1.0f - imu_w) * vel_baro;
 
-  // Fuse velocity
-  fuse.vel = imu_w * fuse.vel_imu + (1.0f - imu_w) * vel_baro;
-
-  // Slowly pull IMU velocity toward baro reference to limit drift.
-  // Skip during boost so baro lag doesn't contaminate the fast IMU estimate.
-  if (!in_boost) {
-    fuse.vel_imu = fuse.vel_imu * 0.97f + vel_baro * 0.03f;
+  // drift correction
+  if (!in_boost && !hit_apogee) {
+    fuse.vel_v_imu = fuse.vel_v_imu * 0.97f + vel_baro * 0.03f;
   }
-
-  // ── Integrate fused velocity → altitude ──────────────────────────
-  fuse.alt += fuse.vel * dt;
-
-  // Complementary correction: nudge fused altitude toward baro.
-  // Small α during boost (trust IMU), larger α at other times (trust baro).
-  float baro_alpha = in_boost ? 0.01f : 0.05f;
-  fuse.alt = (1.0f - baro_alpha) * fuse.alt + baro_alpha * baro_rel;
+  // ---------------------------------------------------
+  // Altitude integration
+  // ---------------------------------------------------
+  fuse.alt += fuse.vel_v * dt;
+  float alpha = in_boost ? 0.01f : 0.05f;
+  fuse.alt = (1.0f - alpha) * fuse.alt + alpha * baro_rel;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -251,10 +260,14 @@ void checkCommands() {
     ready = (bool)val;
     pyro1_armed = (bool)val;
     start_alt = water_alt;
+    apogee = 0;
+    max_vel = 0;
     fusionReset(0.0f);
     checkCommandsMaxTime = ready ? 50 : 100;
   }
   if (cmd == 5) {
+    apogee = 0;
+    max_vel = 0;
     start_alt = water_alt;
     fusionReset(0.0f);
   }
@@ -280,11 +293,11 @@ void setup() {
   bmeOK = bme.begin(BME280_ADDR);
 
   mpu.initialize();
-  mpu.setFullScaleAccelRange(0);
+  mpu.setFullScaleAccelRange(3);
   mpuOK = mpu.testConnection();
-  mpu.setXAccelOffset(-1052);
-  mpu.setYAccelOffset(-13);
-  mpu.setZAccelOffset(529);
+  mpu.setXAccelOffset(-80);
+  mpu.setYAccelOffset(0);
+  mpu.setZAccelOffset(0);
   mpu.setXGyroOffset(141);
   mpu.setYGyroOffset(9);
   mpu.setZGyroOffset(-32);
@@ -367,13 +380,14 @@ void loop() {
 
   // ── Sensor fusion ─────────────────────────────────────────────────
   float baro_rel = water_alt - start_alt;
-  fusionUpdate(baro_rel, aly);
+  fusionUpdate(baro_rel, alx, aly, alz);
 
-  float altitude = fuse.alt;  // fused relative altitude  [m]
-  float vel = fuse.vel;       // fused vertical velocity   [m/s]
+  float altitude = fuse.alt;
+  float vel = fuse.vel_v;
+  float vel_fwd = fuse.vel_fwd;
 
   if (altitude > apogee) apogee = altitude;
-  if (vel > max_vel) max_vel = vel;
+  if (vel_fwd > max_vel) max_vel = vel_fwd;
 
   // ── Status bytes ──────────────────────────────────────────────────
   status_code = 0;
@@ -394,8 +408,10 @@ void loop() {
   // ══════════════════════════════════════════
 
   // 1 — Launch detect
-  if (ready && !launched && (aly > 16000 || altitude > 5.0f)) {
+  static unsigned long launchTime = 0;
+  if (ready && !launched && (aly > BOOST_THRESHOLD || altitude > 4.0f)) {
     launched = true;
+    launchTime = now;
     setLED(1, 1, 0);
   }
 
@@ -403,7 +419,7 @@ void loop() {
   if (launched && altitude > min_fire_alt && !alt_threshold)
     alt_threshold = true;
 
-  // 3 — Burnout detection (MPU-based, debounced)
+  // 3 — Burnout detection
   static uint8_t boost_cnt = 0;
   static uint8_t burnout_cnt = 0;
 
@@ -424,10 +440,9 @@ void loop() {
           in_boost = false;
           burnout_detected = true;
           burnout_cnt = 0;
-
-          if (pyro1_armed && alt_threshold)
+          if (pyro1_armed && alt_threshold && now - launchTime >= 750) {
             pyro1_state = true;
-
+          }
           setLED(0, 1, 1);
         }
       } else {
@@ -437,14 +452,14 @@ void loop() {
   }
 
   // 4 — Apogee detect
-  if (launched && !hit_apogee && (vel < -0.3f || apogee - altitude > 0.3f)) {
+  if (launched && !hit_apogee && vel < -0.3f && apogee - altitude > 0.5f) {
     hit_apogee = true;
     setLED(1, 0, 0);
   }
 
   // 5 — Landing detect
   static unsigned long landTime = 0;
-  if (hit_apogee && !landed && fabsf(vel) < 2.0f) {
+  if (hit_apogee && !landed && fabsf(vel) < 3.0f) {
     if (landTime == 0) landTime = now;
     if (now - landTime > 2000) {
       setLED(0, 1, 0);
@@ -533,15 +548,15 @@ void loop() {
   }
 
   // ── Telemetry packet ──────────────────────────────────────────────
-  int16_t alt_i = (int16_t)(altitude * 100.0f);
+  int32_t alt_i = (int32_t)(altitude * 100.0f);
   int16_t volt_i = (int16_t)(voltage * 100.0f);
-  int16_t vel_i = (int16_t)(vel * 100.0f);
-  int16_t apo_i = (int16_t)(apogee * 100.0f);
+  int32_t vel_i = (int32_t)(vel * 100.0f);
+  int32_t apo_i = (int32_t)(apogee * 100.0f);
   uint32_t pressure_i = (uint32_t)pressure;
 
   char packet[180];
   snprintf(packet, sizeof(packet),
-           "%02X;%lu;%d;%d;%d;%d;%u;%u;%u;%d;%lu;%u;%d;%u;%d;%d;%u",
+           "%02X;%lu;%ld;%d;%d;%d;%u;%u;%u;%d;%lu;%u;%d;%u;%ld;%ld;%u",
            TeamID, now,
            alt_i, alx, aly, alz,
            heading, status_code, pyro1_code,
