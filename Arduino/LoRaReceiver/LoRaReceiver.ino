@@ -132,10 +132,10 @@ void loop() {
     }
 
     if (count >= 17) {
-      float altitude = atoi(fields[2]) / 100.0f;
+      float altitude = atol(fields[2]) / 100.0f;
       float voltage = atoi(fields[12]) / 100.0f;
-      float vel = atoi(fields[14]) / 100.0f;
-      float apogee = atoi(fields[15]) / 100.0f;
+      float vel = atol(fields[14]) / 100.0f;
+      float apogee = atol(fields[15]) / 100.0f;
 
       // teamid;time;alt;alx;aly;alz;heading;status;pyro;temp;pressure;hum;volt;init;vel;apogee;pktid;rssi
       Serial.print(fields[0]);
